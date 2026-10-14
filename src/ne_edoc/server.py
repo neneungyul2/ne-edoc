@@ -214,7 +214,7 @@ def export(box="ENDLIST", start_date=None, end_date=None, keyword=None, out_dir=
                 w.writerow({
                     "doc_no": doc["doc_no"], "title": doc["title"], "form": row.get("양식", "") or doc.get("form_alias", ""),
                     "drafter": row.get("기안자", ""), "status": row.get("상태", ""),
-                    "date": row.get("결재완료일") or row.get("기안일") or row.get("수신일") or "",
+                    "date": row.get("결재완료일_iso") or row.get("기안일_iso") or row.get("결재완료일") or row.get("기안일") or "",
                     "box": box, "attachment_count": len(doc["attachments"]),
                     "attachment_names": " | ".join(a["name"] for a in doc["attachments"]),
                     "approvers": " > ".join(f"{s['name']}({s['role']})" for s in steps),

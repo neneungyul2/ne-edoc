@@ -51,10 +51,10 @@ _BLOCK = {"p", "div", "br", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6"
 
 def html_to_text(node) -> str:
     """글자 단위로 쪼개진 span 을 붙이고, 표는 '칸 | 칸' 형태로 바꿔 읽기 좋은 글로 만든다."""
-    from bs4 import NavigableString, Tag, Comment
+    from bs4 import NavigableString, Tag, Comment, Doctype, Declaration, ProcessingInstruction
 
     def walk(n) -> str:
-        if isinstance(n, Comment):
+        if isinstance(n, (Comment, Doctype, Declaration, ProcessingInstruction)):
             return ""
         if isinstance(n, NavigableString):
             return str(n).replace("\r", "").replace("\n", " ")
@@ -72,8 +72,12 @@ def html_to_text(node) -> str:
                     continue
                 cells = []
                 for td in tr.find_all(["td", "th"], recursive=False):
-                    t = re.sub(r"\s+", " ", walk_children(td)).strip()
+                    t = re.sub(r"[ \t\xa0]+", " ", walk_children(td))
+                    t = re.sub(r" *\n *", "\n", t)
+                    t = re.sub(r"\n{2,}", "\n", t).strip()
                     cells.append(t)
+                while cells and not cells[-1]:
+                    cells.pop()
                 if any(cells):
                     rows.append(" | ".join(cells))
             return "\n" + "\n".join(rows) + "\n"
@@ -90,6 +94,22 @@ def html_to_text(node) -> str:
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _norm_date(v: str, today=None):
+    """그룹웨어 목록의 날짜 표기(14:02 / 10-13 11:40 / 2025-11-03)를 YYYY-MM-DD[ HH:MM] 로 바꾼다."""
+    from datetime import date
+    v = (v or "").strip()
+    today = today or date.today()
+    if re.fullmatch(r"\d{1,2}:\d{2}", v):
+        return f"{today:%Y-%m-%d} {v}"
+    m = re.fullmatch(r"(\d{2})-(\d{2})(?: (\d{1,2}:\d{2}))?", v)
+    if m:
+        y = today.year if (int(m.group(1)), int(m.group(2))) <= (today.month, today.day) else today.year - 1
+        return f"{y}-{m.group(1)}-{m.group(2)}" + (f" {m.group(3)}" if m.group(3) else "")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}( \d{1,2}:\d{2})?", v):
+        return v
+    return v
 
 
 def _jquery_param(pairs) -> str:
@@ -252,6 +272,9 @@ class EdocClient:
                 row["has_attachment"] = tr.select_one('[onclick^="viewAppAttachPop"]') is not None
             else:
                 row["has_attachment"] = None  # 이 문서함 목록은 첨부 여부를 보여주지 않음
+            for k in list(row):
+                if k.endswith("일") or k.endswith("일시") or k.endswith("일자"):
+                    row[k + "_iso"] = _norm_date(row[k])
             row["instance_id"] = args[1] if len(args) > 1 else ""
             row["ref_id"] = args[5] if len(args) > 5 else ""
             row["box"] = box
@@ -351,6 +374,8 @@ class EdocClient:
     def get_document(self, instance_id: str, ref_id: str, box="ENDLIST",
                      include_html=False, include_line=True) -> dict:
         box = resolve_box(box)
+        if self._is_converted(instance_id, ref_id):
+            return self._get_converted_document(instance_id, ref_id, box, include_html, include_line)
         html = self._call("POST", CTRL, data={
             "nextpage": "/app/wih/wihMain.jsp", "instanceId": instance_id,
             "refId": ref_id, "menuKind": box, "isViewMode": "true"})
@@ -380,6 +405,68 @@ class EdocClient:
             except EdocError as e:
                 doc["approval_line_error"] = str(e)
         return doc
+
+    # ------------------------------------------------------------ 옛 문서(이관 문서)
+    @staticmethod
+    def _is_converted(instance_id: str, ref_id: str) -> bool:
+        """예전 그룹웨어에서 옮겨온 문서(대략 2019년 이전)는 ref_id 가 MIG 로 시작한다."""
+        return (ref_id or "").startswith("MIG") or str(instance_id) == "1"
+
+    def _get_converted_document(self, instance_id, ref_id, box, include_html, include_line) -> dict:
+        menu = {"APP_SHARE": "SHARELIST"}.get(box, box)
+        html = self._call("POST", BASE + "/app/conversion/index.jsp", data={
+            "isViewMode": "true", "appId": ref_id, "menuKind": menu,
+            "addParamJson": "{}", "isPortal": "false"})
+        soup = BeautifulSoup(html, "html.parser")
+        area = soup.find(id="mainForm") or soup.find(id="formarea") or soup.body
+        if area is None:
+            raise EdocError("옛 문서를 열 수 없습니다. (이관 문서 화면 구조가 예상과 다릅니다)")
+        for t in area.find_all(["script", "style"]):
+            t.decompose()
+        body_text = html_to_text(area)
+        body_text = "\n".join(ln for ln in body_text.split("\n")
+                               if not re.match(r"\s*var url\s*=|.*InnoFD", ln))
+        if len(body_text) < 20:
+            raise EdocError("옛 문서 본문을 찾지 못했습니다.")
+
+        def pick(label):
+            m = re.search(label + r"\s*\|\s*([^\n|]+)", body_text)
+            if not m:
+                return ""
+            v = re.split(r"\s+(관련문서|코칭사항|보관함|수신처)\b", m.group(1))[0]
+            return v.strip()[:150]
+
+        doc = {
+            "ref_id": ref_id, "instance_id": instance_id, "box": box, "converted": True,
+            "doc_no": pick("문서번호"), "title": pick(r"제\s*목"), "form_alias": "",
+            "status": "", "body_text": body_text,
+            "attachments": self._parse_attachments(html, soup) + self._parse_conv_attachments(html),
+            "note": "예전 그룹웨어에서 옮겨온 문서입니다.",
+        }
+        if include_html:
+            doc["body_html"] = str(area)
+        if include_line:
+            try:
+                doc.update(self.get_approval_line(ref_id, box))
+            except EdocError as e:
+                doc["approval_line_error"] = str(e)
+        return doc
+
+    @staticmethod
+    def _parse_conv_attachments(html: str) -> list:
+        """옛 문서의 첨부(ConvDownController). file_id 는 'conv:' + 내려받기 주소의 쿼리."""
+        qs = re.findall(r'file_list\.push\("([^"]+)"\)', html)
+        names = re.findall(r'file_name\.push\("([^"]*)"\)', html)
+        sizes = re.findall(r'file_size\.push\((\d+)\)', html)
+        out, seen = [], set()
+        for i, q in enumerate(qs):
+            if q in seen:
+                continue
+            seen.add(q)
+            out.append({"file_id": "conv:" + q,
+                        "name": names[i] if i < len(names) else "",
+                        "size": int(sizes[i]) if i < len(sizes) else None})
+        return out
 
     @staticmethod
     def _parse_attachments(html: str, soup) -> list:
@@ -448,7 +535,12 @@ class EdocClient:
         save.mkdir(parents=True, exist_ok=True)
         for attempt in range(2):
             self._throttle()
-            r = self.s.get(BASE + "/DownController.do", params={"fileId": file_id}, timeout=120, stream=True)
+            if file_id.startswith("conv:"):
+                q = file_id[5:]
+                r = self.s.get(BASE + "/ConvDownController" + (q if q.startswith("?") else "?" + q),
+                               timeout=120, stream=True)
+            else:
+                r = self.s.get(BASE + "/DownController.do", params={"fileId": file_id}, timeout=120, stream=True)
             ctype = r.headers.get("Content-Type", "")
             if "text/html" in ctype:
                 html = self._text(r)
@@ -458,7 +550,12 @@ class EdocClient:
                     continue
                 raise EdocError("첨부파일을 받지 못했습니다. (파일이 없거나 권한이 없을 수 있습니다)")
             break
-        name = file_name or self._filename_from(r.headers.get("Content-Disposition", "")) or file_id
+        conv_name = None
+        if file_id.startswith("conv:"):
+            m = re.search(r"down_filename=([^&]+)", file_id)
+            conv_name = unquote(m.group(1)) if m else None
+        name = (file_name or self._filename_from(r.headers.get("Content-Disposition", ""))
+                or conv_name or file_id)
         name = re.sub(r'[\\/:*?"<>|]', "_", name)
         path = save / name
         if path.exists():

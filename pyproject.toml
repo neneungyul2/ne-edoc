@@ -1,6 +1,6 @@
 [project]
 name = "ne-edoc"
-version = "0.2.0"
+version = "0.2.2"
 description = "NE능률 그룹웨어 전자결재·전자문서를 Claude가 조회하도록 하는 MCP 서버 (조회 전용)"
 readme = "README.md"
 requires-python = ">=3.10"
